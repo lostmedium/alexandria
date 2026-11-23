@@ -1,0 +1,5 @@
+{
+  // jsii refuses to use its package cache when a parent directory is group-writable,
+  // and the default Codespaces image ships ~/.cache as 0775.
+  "postCreateCommand": "mkdir -p \"$HOME/.cache\" && chmod go-w \"$HOME/.cache\""
+}
