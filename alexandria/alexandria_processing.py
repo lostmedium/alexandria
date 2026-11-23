@@ -6,6 +6,9 @@ from aws_cdk import (
     RemovalPolicy,
     Size,
     Stack,
+    ArnFormat,
+    aws_dynamodb as dynamodb,
+    aws_iam as iam,
     aws_lambda as lambda_,
     aws_lambda_event_sources as event_sources,
     aws_logs as logs,
@@ -18,7 +21,8 @@ from constructs import Construct
 
 class AlexandriaProcessingStack(Stack):
     def __init__(
-        self, scope: Construct, construct_id: str, *, download_bucket_name: str, **kwargs
+        self, scope: Construct, construct_id: str, *, download_bucket_name: str,
+        coordination_table: dynamodb.ITable, cleanup_function_name: str, **kwargs
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
@@ -29,6 +33,8 @@ class AlexandriaProcessingStack(Stack):
             encryption=s3.BucketEncryption.S3_MANAGED,
             enforce_ssl=True,
             removal_policy=RemovalPolicy.RETAIN,
+            versioned=True,
+            lifecycle_rules=[s3.LifecycleRule(noncurrent_version_expiration=Duration.days(7))],
         )
         markdown = s3.Bucket(
             self, "Markdown",
@@ -36,6 +42,8 @@ class AlexandriaProcessingStack(Stack):
             encryption=s3.BucketEncryption.S3_MANAGED,
             enforce_ssl=True,
             removal_policy=RemovalPolicy.RETAIN,
+            versioned=True,
+            lifecycle_rules=[s3.LifecycleRule(noncurrent_version_expiration=Duration.days(7))],
         )
         chunks = s3.Bucket(
             self, "Chunks",
@@ -43,7 +51,12 @@ class AlexandriaProcessingStack(Stack):
             encryption=s3.BucketEncryption.S3_MANAGED,
             enforce_ssl=True,
             removal_policy=RemovalPolicy.RETAIN,
+            versioned=True,
+            lifecycle_rules=[s3.LifecycleRule(noncurrent_version_expiration=Duration.days(7))],
         )
+        self.parts_bucket_name = parts.bucket_name
+        self.markdown_bucket_name = markdown.bucket_name
+        self.chunks_bucket_name = chunks.bucket_name
 
         for name, source, destination, handler, suffix in [
             ("Split", bucket, parts, "processing.split_handler", None),
@@ -61,7 +74,7 @@ class AlexandriaProcessingStack(Stack):
                 encryption=sqs.QueueEncryption.SQS_MANAGED,
                 visibility_timeout=Duration.minutes(90),
                 retention_period=Duration.days(14),
-                dead_letter_queue=sqs.DeadLetterQueue(queue=dlq, max_receive_count=5),
+                dead_letter_queue=sqs.DeadLetterQueue(queue=dlq, max_receive_count=100),
                 removal_policy=RemovalPolicy.RETAIN,
             )
             processing_logs = logs.LogGroup(
@@ -72,17 +85,43 @@ class AlexandriaProcessingStack(Stack):
             function = lambda_.DockerImageFunction(
                 self, f"{name}Function",
                 code=lambda_.DockerImageCode.from_image_asset(
-                    str(Path(__file__).parent.parent / "processing"),
+                    str(Path(__file__).parent.parent),
+                    file="processing/Dockerfile",
+                    exclude=[
+                        ".git", "cdk.out", "**/__pycache__", "tests", ".venv",
+                        "alexandria", "download", "cleanup", "staging",
+                        "README.md", "LICENSE", "app.py", "cdk.json", "requirements.txt",
+                    ],
                     cmd=[handler],
                 ),
                 timeout=Duration.minutes(15),
                 memory_size=4096,
                 ephemeral_storage_size=Size.gibibytes(10),
-                environment={"DESTINATION_BUCKET": destination.bucket_name},
+                environment={
+                    "DESTINATION_BUCKET": destination.bucket_name,
+                    "SOURCE_BUCKET": bucket.bucket_name,
+                    "CHUNKS_BUCKET": chunks.bucket_name,
+                    "COORDINATION_TABLE": coordination_table.table_name,
+                    "CLEANUP_FUNCTION_NAME": cleanup_function_name,
+                },
                 log_group=processing_logs,
             )
             source.grant_read(function)
             destination.grant_put(function)
+            bucket.grant_read(function)
+            coordination_table.grant_read_write_data(function)
+            if name == "Split":
+                function.add_to_role_policy(iam.PolicyStatement(
+                    actions=["lambda:InvokeFunction"],
+                    resources=[self.format_arn(
+                        service="lambda", resource="function",
+                        resource_name=cleanup_function_name,
+                        arn_format=ArnFormat.COLON_RESOURCE_NAME,
+                    )],
+                ))
+            if name == "Chunk":
+                chunks.grant_read(function)
+                chunks.grant_delete(function)
             function.add_event_source(event_sources.SqsEventSource(queue, batch_size=1))
             filters = [s3.NotificationKeyFilter(suffix=suffix)] if suffix else []
             source.add_event_notification(

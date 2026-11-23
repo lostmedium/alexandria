@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import shutil
@@ -8,8 +9,11 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 import boto3
+import coordination
 import urllib3
 from boto3.dynamodb.conditions import Key
+from botocore.config import Config
+from botocore.exceptions import ClientError
 from urllib3.util import Retry, Timeout
 
 
@@ -21,6 +25,9 @@ http = urllib3.PoolManager(
 )
 dynamodb = boto3.resource("dynamodb")
 s3 = boto3.client("s3")
+lambda_client = boto3.client(
+    "lambda", config=Config(read_timeout=900, retries={"total_max_attempts": 1}),
+)
 WORK_DIR = Path(tempfile.gettempdir()) / "alexandria-download"
 MAX_FEED_BYTES = 5 * 1024 * 1024
 
@@ -79,19 +86,43 @@ def process_item(table, bucket, item):
         logger.info("No update for %s", item["sk"])
         return
 
-    with tempfile.TemporaryDirectory(dir=WORK_DIR) as directory:
-        path = Path(directory) / "download.pdf"
-        download_pdf(item["link"], path)
-        s3.upload_file(
-            str(path), bucket, item["fname"],
-            ExtraArgs={"ContentType": "application/pdf"},
+    key = item["fname"]
+    source = coordination.source_id(key)
+    with coordination.locked(source):
+        try:
+            previous_version = s3.head_object(Bucket=bucket, Key=key).get("VersionId", "null")
+        except ClientError as error:
+            if error.response["Error"]["Code"] not in ("404", "NoSuchKey", "NotFound"):
+                raise
+            previous_version = ""
+        coordination.put_state(
+            source, status="blocked", version=previous_version, source_key=key,
         )
-    table.update_item(
-        Key={"pk": item["pk"], "sk": item["sk"]},
-        UpdateExpression="SET lastupdate = :date",
-        ConditionExpression="attribute_exists(pk) AND attribute_exists(sk)",
-        ExpressionAttributeValues={":date": date},
-    )
+        result = lambda_client.invoke(
+            FunctionName=os.environ["CLEANUP_FUNCTION_NAME"],
+            InvocationType="RequestResponse",
+            Payload=json.dumps({"key": key}).encode("utf-8"),
+        )
+        try:
+            payload = result["Payload"].read()
+        finally:
+            result["Payload"].close()
+        if result.get("FunctionError"):
+            raise RuntimeError(f"Cleanup failed for {key}: {payload.decode('utf-8')}")
+
+        with tempfile.TemporaryDirectory(dir=WORK_DIR) as directory:
+            path = Path(directory) / "download.pdf"
+            download_pdf(item["link"], path)
+            s3.upload_file(
+                str(path), bucket, key,
+                ExtraArgs={"ContentType": "application/pdf"},
+            )
+        table.update_item(
+            Key={"pk": item["pk"], "sk": item["sk"]},
+            UpdateExpression="SET lastupdate = :date",
+            ConditionExpression="attribute_exists(pk) AND attribute_exists(sk)",
+            ExpressionAttributeValues={":date": date},
+        )
     logger.info("Downloaded %s", item["sk"])
 
 

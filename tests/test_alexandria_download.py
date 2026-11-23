@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import os
 import tempfile
 import unittest
@@ -9,12 +10,19 @@ import aws_cdk as cdk
 import boto3
 from aws_cdk.assertions import Match, Template
 
+from test_alexandria_support import FakeCoordination
+from alexandria.alexandria_coordination import AlexandriaCoordinationStack
 from alexandria.alexandria_download import AlexandriaDownloadStack
 
 
 class DownloadStackTest(unittest.TestCase):
     def test_resources(self):
-        template = Template.from_stack(AlexandriaDownloadStack(cdk.App(), "Download"))
+        app = cdk.App()
+        coordination = AlexandriaCoordinationStack(app, "Coordination")
+        template = Template.from_stack(AlexandriaDownloadStack(
+            app, "Download", coordination_table=coordination.table,
+            coordination_layer=coordination.layer,
+        ))
         template.has_resource_properties("AWS::Lambda::Function", {
             "Handler": "download.lambda_handler",
             "Runtime": "python3.13",
@@ -32,6 +40,10 @@ class DownloadStackTest(unittest.TestCase):
                 "IgnorePublicAcls": True,
                 "RestrictPublicBuckets": True,
             },
+            "VersioningConfiguration": {"Status": "Enabled"},
+            "LifecycleConfiguration": {"Rules": [{
+                "Status": "Enabled", "NoncurrentVersionExpiration": {"NoncurrentDays": 7},
+            }]},
         })
         template.has_resource_properties("AWS::Events::Rule", {
             "ScheduleExpression": "cron(0 0 * * ? *)",
@@ -75,6 +87,9 @@ class DownloadHandlerTest(unittest.TestCase):
         self.work_patch = patch.object(handler, "WORK_DIR", self.work_dir)
         self.work_patch.start()
         self.addCleanup(self.work_patch.stop)
+        self.coordination_patch = patch.object(handler, "coordination", FakeCoordination())
+        self.coordination_patch.start()
+        self.addCleanup(self.coordination_patch.stop)
         self.item = {
             "pk": "PDF#", "sk": "PDF#guide.pdf", "fname": "guide.pdf",
             "rss": "https://example.com/feed", "link": "https://example.com/guide.pdf",
@@ -93,16 +108,22 @@ class DownloadHandlerTest(unittest.TestCase):
     def test_upload_before_update_and_cleanup(self):
         table = Mock()
         s3 = Mock()
+        s3.head_object.return_value = {"VersionId": "old"}
+        invoke = Mock()
+        invoke.invoke.return_value = {"Payload": io.BytesIO(b'{"status":"ok"}')}
         order = Mock()
+        order.attach_mock(invoke, "lambda")
         order.attach_mock(s3, "s3")
         order.attach_mock(table, "table")
         pdf = response(b"%PDF-1.7\ncontent")
         with patch.object(handler, "newest_rss_date", return_value="new date"), \
              patch.object(handler.http, "request", return_value=pdf), \
-             patch.object(handler, "s3", s3):
+             patch.object(handler, "s3", s3), \
+             patch.object(handler, "lambda_client", invoke), \
+             patch.dict(os.environ, {"CLEANUP_FUNCTION_NAME": "cleanup"}):
             handler.process_item(table, "bucket", self.item)
         self.assertEqual([entry[0] for entry in order.mock_calls],
-                         ["s3.upload_file", "table.update_item"])
+                         ["s3.head_object", "lambda.invoke", "s3.upload_file", "table.update_item"])
         self.assertEqual(s3.upload_file.call_args.args[1:], ("bucket", "guide.pdf"))
         self.assertEqual(table.update_item.call_args.kwargs["ExpressionAttributeValues"],
                          {":date": "new date"})
@@ -111,9 +132,11 @@ class DownloadHandlerTest(unittest.TestCase):
     def test_unchanged_date_skips_download(self):
         table = Mock()
         with patch.object(handler, "newest_rss_date", return_value="TBD"), \
-             patch.object(handler, "download_pdf") as download:
+             patch.object(handler, "download_pdf") as download, \
+             patch.object(handler, "lambda_client") as invoke:
             handler.process_item(table, "bucket", self.item)
         download.assert_not_called()
+        invoke.invoke.assert_not_called()
         table.update_item.assert_not_called()
 
     def test_invalid_pdf_or_upload_failure_does_not_update(self):
@@ -123,13 +146,37 @@ class DownloadHandlerTest(unittest.TestCase):
                 table = Mock()
                 s3 = Mock()
                 s3.upload_file.side_effect = upload_error
+                invoke = Mock()
+                invoke.invoke.return_value = {"Payload": io.BytesIO(b"{}")}
                 with patch.object(handler, "newest_rss_date", return_value="new"), \
                      patch.object(handler.http, "request", return_value=response(data)), \
-                     patch.object(handler, "s3", s3):
+                     patch.object(handler, "s3", s3), \
+                     patch.object(handler, "lambda_client", invoke), \
+                     patch.dict(os.environ, {"CLEANUP_FUNCTION_NAME": "cleanup"}):
                     with self.assertRaises((ValueError, OSError)):
                         handler.process_item(table, "bucket", self.item)
                 table.update_item.assert_not_called()
                 self.assertEqual(list(self.work_dir.iterdir()), [])
+
+    def test_cleanup_failure_prevents_download_and_update(self):
+        table, invoke = Mock(), Mock()
+        s3 = Mock()
+        s3.head_object.return_value = {"VersionId": "old"}
+        invoke.invoke.return_value = {
+            "FunctionError": "Unhandled", "Payload": io.BytesIO(b"cleanup error"),
+        }
+        with patch.object(handler, "newest_rss_date", return_value="new"), \
+             patch.object(handler, "lambda_client", invoke), \
+             patch.object(handler, "s3", s3), \
+             patch.object(handler, "download_pdf") as download, \
+             patch.dict(os.environ, {"CLEANUP_FUNCTION_NAME": "cleanup"}):
+            with self.assertRaisesRegex(RuntimeError, "cleanup error"):
+                handler.process_item(table, "bucket", self.item)
+        download.assert_not_called()
+        table.update_item.assert_not_called()
+        self.assertEqual(handler.coordination.state(
+            handler.coordination.source_id(self.item["fname"])
+        )["status"], "blocked")
 
     def test_handler_paginates_continues_after_failure_and_cleans_stale_files(self):
         (self.work_dir / "stale").write_text("stale")

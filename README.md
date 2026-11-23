@@ -22,14 +22,23 @@ For the IAM user guide, add an item with these string attributes:
 }
 ```
 
-Deploy with `cdk deploy AlexandriaDynamodbStack AlexandriaDownloadStack AlexandriaProcessingStack`. A
+Deploy with `cdk deploy AlexandriaDynamodbStack AlexandriaCoordinationStack
+AlexandriaDownloadStack AlexandriaProcessingStack AlexandriaCleanupStack
+AlexandriaStagingStack`. A
 retained `pdf` table must be handled before creating a replacement stack with
-the same table name.
+the same table name. Deploy outside the download schedule, and ensure the
+cleanup stack is ready before the downloader runs.
 
 If the earlier combined download/processing stack was deployed, moving the
 processing resources creates new buckets and queues; retained data and pending
 messages are not migrated automatically. Inspect and handle them before
 replacing the old processing resources.
+
+If cleanup and staging were already deployed inside `AlexandriaProcessingStack`,
+pause scheduled downloads, deploy the updated processing stack to remove those
+resources, and then deploy the cleanup and staging stacks. The old staging
+bucket is retained but is not moved or automatically migrated; the new staging
+stack creates a new bucket. Resume downloads only after cleanup is deployed.
 
 The download stack uses the existing `pdf` table and creates a private,
 retained S3 bucket and a Lambda function scheduled daily at 00:00 UTC. The function
@@ -37,13 +46,17 @@ can also be invoked manually from the Lambda console or AWS CLI with an empty
 event (`{}`). Each record's `rss` must be an RSS 2.0 feed with dated items;
 the most recent item's `pubDate` is compared with `lastupdate`. When it differs,
 the PDF at `link` is uploaded under the `fname` S3 key and `lastupdate` is set
-to that RSS date only after the upload succeeds. Reusing a `fname` overwrites
-the existing object. Failed records are logged and cause the invocation to fail;
+to that RSS date only after the upload succeeds. Before downloading, a cleanup
+function deletes current parts, Markdown and chunks for that exact source key.
+If cleanup or download fails, the date is not updated, but previously deleted
+outputs are not automatically restored. Reusing a `fname` overwrites the
+existing object. Failed records are logged and cause the invocation to fail;
 successful records are skipped on retry. Downloads use temporary storage, which
 is cleaned after each invocation and before the next one after an interruption.
 The ARM64 function uses the Lambda runtime's `urllib3` and boto3, with no requests layer.
-The local `boto3` requirement is used by the downloader tests; it is not bundled
-with the Lambda.
+The cleanup and staging stacks must be deployed before an updated download
+function runs. The local `boto3` requirement is used by the downloader tests; it
+is not bundled with the Lambda.
 
 ## PDF preparation
 
@@ -56,12 +69,12 @@ downloads bucket -> SQS -> split PDF -> parts bucket -> SQS -> Markdown
 ```
 
 Only object-created events start processing; non-PDF source keys are ignored.
-Existing objects do not trigger processing on deployment: upload them again if
-they should be processed. S3 versioning is not enabled on any of the buckets.
-If the source key is overwritten before a queued event is processed, its ETag
-check fails rather than processing the replacement as the earlier upload. The
-event retries and eventually reaches the dead-letter queue; the replacement
-upload has its own event.
+Before deploying this coordination change, drain the processing queues and
+wait for in-flight work to finish. Legacy part and Markdown events do not
+contain a generation identifier and are skipped. Existing PDFs do not trigger
+processing on deployment: upload them again to generate completion markers and
+staging manifests. When a PDF is overwritten, events from older versions are
+skipped rather than processing them as the replacement.
 
 PDFs are split into parts of at most 1,000 pages using PyMuPDF and converted
 using pymupdf4llm without forced OCR. Markdown is split at headings, paragraphs,
@@ -77,30 +90,73 @@ without its extension. Revision, part and source-key identifiers are in each
 filename. For example, `guides/My guide.pdf` produces:
 
 ```
-parts bucket:    My guide/source-<source-key-hash>__revision-<etag-hash>__part-000001.pdf
-Markdown bucket: My guide/source-<source-key-hash>__revision-<etag-hash>__part-000001.md
-chunks bucket:   My guide/source-<source-key-hash>__revision-<etag-hash>__part-000001-chunk-000001.md
+parts bucket:    My guide/source-<source-key-hash>__revision-<pdf-hash>__generation-<generation-hash>__part-000001.pdf
+Markdown bucket: My guide/source-<source-key-hash>__revision-<pdf-hash>__generation-<generation-hash>__part-000001.md
+chunks bucket:   My guide/source-<source-key-hash>__revision-<pdf-hash>__generation-<generation-hash>__part-000001-chunk-000001-<chunk-hash>.md
 ```
 
 Each bucket identifies its stage, so no additional `parts`, `markdown` or
 `chunks` folder is needed. The source-key hash distinguishes same-named PDFs
 from different source paths, and the revision hash keeps different uploads
-separate. The original source key is also retained in object metadata and in
-chunk provenance.
+separate. The generation hash identifies the specific S3 version of the PDF.
+The original source key is also retained in object metadata and in chunk provenance.
 
-The revision hash is SHA-256 of the event ETag. Each chunk also includes its
+The revision hash is SHA-256 of the PDF bytes, and the chunk hash is SHA-256
+of the entire chunk, including provenance. Each chunk also includes its
 original source key, part, document title and section when available, and chunk
-position. Different ETags produce separate output sets even though S3 bucket
-versioning is disabled; old parts, Markdown and chunks are not automatically
-deleted. Retries can overwrite objects for the same ETag.
+position. The ETag is still used to ensure the downloaded PDF matches its
+S3 event. Retries can overwrite objects for the same content.
 
 Chunked Markdown targets 15,000 characters of content, following SCS's
 `text2chunk` limit; continuation and provenance headings are added afterward,
-and sizes are measured in characters, not tokens. SCS stages full groups of
-100 chunks separately from the remaining 0-99, but does not define different
-chunk sizes for different AI model tiers. This stack stops at the chunked
-Markdown bucket and does not stage or invoke those AI-processing steps.
-All four buckets and the queues are retained on stack deletion.
+and sizes are measured in characters, not tokens. This stack does not invoke
+AI-processing steps.
+
+## Staging and retention
+
+The coordination stack tracks each PDF's generation and completed parts in
+DynamoDB. Once all parts have been chunked, a completion marker under
+`__completion__/` in the chunks bucket sends a message to the staging queue.
+There is no scheduled staging rule. The staging Lambda can also be invoked
+manually with `{"source_key": "guides/My guide.pdf"}` after processing finishes.
+
+Staging copies the completed PDF's chunks and then atomically writes
+`My guide/source-<source-key-hash>__manifest.json` in the staging bucket. The
+manifest identifies the source PDF version, generation, PDF hash and each
+chunk's key, S3 version ID and SHA-256 hash. **Read the manifest**, not a bucket
+listing: chunks copied during an unsuccessful attempt may remain unreferenced.
+Consumers should retrieve each referenced object using its version ID, so a
+reader holding an older manifest can still read its chunks until the seven-day
+noncurrent-version retention expires; this requires `s3:GetObjectVersion`
+permission. For example, a manifest has this shape:
+
+```json
+{
+  "source_key": "guides/My guide.pdf",
+  "source_version": "<PDF S3 version ID>",
+  "generation": "<generation hash>",
+  "revision": "<PDF SHA-256>",
+  "chunks": [
+    {"key": "My guide/source-...-chunk-000001-<chunk-hash>.md",
+     "version_id": "<staged S3 version ID>", "sha256": "<chunk SHA-256>"}
+  ]
+}
+```
+
+After publishing the new manifest,
+staging deletes obsolete current chunks for that PDF, without touching other
+PDFs. If processing or copying fails, its previous manifest remains current.
+
+The staging Lambda has a 15-minute timeout. Failed messages retry and may reach
+the staging dead-letter queue; monitor and redrive it. Reinvocation skips
+already-copied chunks. A PDF whose staging takes longer than one invocation
+cannot be published until its copy can finish within that timeout.
+
+All five application buckets have versioning enabled and expire noncurrent
+object versions seven days after they become noncurrent. Current objects do not
+expire under these rules. Deletes create delete markers; older versions remain
+recoverable only until the lifecycle policy expires them. All buckets and the
+queues are retained on stack deletion.
 
 Each stage has a 15-minute timeout, 4 GiB memory and 10 GiB temporary storage.
 Large or complex PDFs can still exceed these limits, including during splitting
@@ -110,13 +166,20 @@ may already be present when a stage fails; the presence of a chunk alone does
 not prove that the entire PDF finished. Temporary working files are cleaned
 after each operation and after an interrupted invocation when processing resumes.
 
-Each queue retains messages for 14 days, uses a 90-minute visibility timeout,
-and sends messages to its own dead-letter queue after five unsuccessful
-receives. Monitor all three queues, dead-letter queues and Lambda logs; there
-are no configured notifications or completion manifest. Investigate and redrive
-failed messages before they expire, and verify all parts and chunks before
-using the results. Reprocessing can generate duplicate events; the same ETag
-uses the same output keys.
+Each processing and staging queue retains messages for 14 days, uses a 90-minute
+visibility timeout, and sends messages to its own dead-letter queue after 100
+unsuccessful receives. Monitor all queues, dead-letter queues and Lambda logs;
+there are no configured alerts. Investigate and redrive failed messages before
+they expire.
+
+Downloads, processing stages and staging use a per-source DynamoDB lease, so
+operations for the same PDF are serialized; different PDFs can proceed in
+parallel. A busy lease causes the message or download to retry. An interrupted
+invocation can hold a lease for up to 31 minutes. The download function clears
+old outputs before downloading; the splitter also clears old outputs before
+processing a new version, including a manual upload. Old queued events are
+ignored. A failed download leaves the prior staging manifest intact, while the
+old PDF version is blocked from being processed as a new update.
 
 Building/deploying the processing images requires a running Docker daemon.
 Run local tests with `python -m unittest discover -s tests` after installing

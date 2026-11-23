@@ -11,12 +11,18 @@ from pathlib import Path
 from urllib.parse import unquote_plus
 
 import boto3
+import coordination
 import pymupdf
 import pymupdf4llm
+from botocore.config import Config
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 s3 = boto3.client("s3")
+lambda_client = boto3.client(
+    "lambda", config=Config(read_timeout=900, retries={"total_max_attempts": 1}),
+)
 PAGE_LIMIT = 1000
 CHUNK_LIMIT = 15000
 WORK_DIR = Path(tempfile.gettempdir()) / "alexandria-processing"
@@ -44,10 +50,12 @@ def events(event):
             ), record["s3"]["object"]
 
 
-def download(bucket, key, path, *, etag=None):
+def download(bucket, key, path, *, etag=None, version=None):
     args = {"Bucket": bucket, "Key": key}
     if etag:
         args["IfMatch"] = etag
+    if version:
+        args["VersionId"] = version
     response = s3.get_object(**args)
     try:
         with open(path, "wb") as target:
@@ -55,6 +63,23 @@ def download(bucket, key, path, *, etag=None):
     finally:
         response["Body"].close()
     return response.get("Metadata", {})
+
+
+def current_version(bucket, key):
+    return s3.head_object(Bucket=bucket, Key=key).get("VersionId", "null")
+
+
+def cleanup(key):
+    result = lambda_client.invoke(
+        FunctionName=os.environ["CLEANUP_FUNCTION_NAME"], InvocationType="RequestResponse",
+        Payload=json.dumps({"key": key}).encode("utf-8"),
+    )
+    try:
+        payload = result["Payload"].read()
+    finally:
+        result["Payload"].close()
+    if result.get("FunctionError"):
+        raise RuntimeError(f"Cleanup failed for {key}: {payload.decode('utf-8')}")
 
 
 def split_handler(event, context):
@@ -65,32 +90,87 @@ def split_handler(event, context):
         etag = obj.get("eTag")
         if not etag:
             raise ValueError(f"Missing ETag for {key}")
-        revision_id = hashlib.sha256(etag.encode()).hexdigest()
+        version = obj.get("versionId") or "null"
         filename = key.rsplit("/", 1)[-1][:-4]
-        source_id = hashlib.sha256(key.encode()).hexdigest()
-        metadata = {"source-key": base64.b64encode(key.encode()).decode()}
-        with workdir() as directory:
-            source = directory / "source.pdf"
-            download(bucket, key, source, etag=etag)
-            with pymupdf.open(source) as document:
-                if document.page_count == 0:
-                    raise ValueError(f"PDF has no pages: {key}")
-                for index, start in enumerate(range(0, document.page_count, PAGE_LIMIT), 1):
-                    part_path = directory / "part.pdf"
-                    with pymupdf.open() as part:
-                        part.insert_pdf(
-                            document, from_page=start,
-                            to_page=min(start + PAGE_LIMIT, document.page_count) - 1,
+        source_id = coordination.source_id(key)
+        generation = coordination.generation_id(version)
+        metadata = {
+            "source-key": base64.b64encode(key.encode()).decode(),
+            "source-version": base64.b64encode(version.encode()).decode(),
+            "generation": generation,
+        }
+        with coordination.locked(source_id):
+            if current_version(bucket, key) != version:
+                logger.info("Skipping stale PDF event for %s", key)
+                continue
+            state = coordination.state(source_id)
+            if state and state.get("status") == "blocked" and state.get("version") == version:
+                logger.info("Skipping blocked PDF version for %s", key)
+                continue
+            if state and state.get("status") == "ready" and state.get("generation") == generation:
+                logger.info("Already split %s", key)
+                continue
+            coordination.put_state(
+                source_id, status="splitting", source_key=key,
+                version=version, generation=generation,
+            )
+            coordination.clear_parts(source_id)
+            cleanup(key)
+            with workdir() as directory:
+                source = directory / "source.pdf"
+                download(bucket, key, source, etag=etag, version=version)
+                with source.open("rb") as file:
+                    revision_id = hashlib.file_digest(file, "sha256").hexdigest()
+                with pymupdf.open(source) as document:
+                    if document.page_count == 0:
+                        raise ValueError(f"PDF has no pages: {key}")
+                    expected = (document.page_count + PAGE_LIMIT - 1) // PAGE_LIMIT
+                    for index, start in enumerate(range(0, document.page_count, PAGE_LIMIT), 1):
+                        part_path = directory / "part.pdf"
+                        with pymupdf.open() as part:
+                            part.insert_pdf(
+                                document, from_page=start,
+                                to_page=min(start + PAGE_LIMIT, document.page_count) - 1,
+                            )
+                            part.save(part_path, garbage=4, deflate=True)
+                        s3.upload_file(
+                            str(part_path), destination,
+                            f"{filename}/source-{source_id}__revision-{revision_id}"
+                            f"__generation-{generation}__part-{index:06d}.pdf",
+                            ExtraArgs={"ContentType": "application/pdf", "Metadata": metadata},
                         )
-                        part.save(part_path, garbage=4, deflate=True)
-                    s3.upload_file(
-                        str(part_path), destination,
-                        f"{filename}/source-{source_id}__revision-{revision_id}"
-                        f"__part-{index:06d}.pdf",
-                        ExtraArgs={"ContentType": "application/pdf", "Metadata": metadata},
-                    )
-                    part_path.unlink()
+                        part_path.unlink()
+            coordination.put_state(
+                source_id, status="ready", source_key=key, version=version,
+                generation=generation, revision=revision_id, expected=expected,
+            )
         logger.info("Split %s into revision %s", key, revision_id)
+
+
+def source_for_part(key):
+    match = re.match(
+        r"^source-([0-9a-f]{64})__revision-[0-9a-f]{64}"
+        r"__generation-([0-9a-f]{64})__part-(\d{6,})",
+        key.rsplit("/", 1)[-1],
+    )
+    if not match:
+        return None
+    return match.groups()
+
+
+def valid_part(bucket, key, obj, source, generation):
+    state = coordination.state(source)
+    if not state or state.get("status") != "ready" or state.get("generation") != generation:
+        return False
+    if current_version(os.environ["SOURCE_BUCKET"], state["source_key"]) != state["version"]:
+        return False
+    try:
+        version = current_version(bucket, key)
+    except ClientError as error:
+        if error.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise
+    return version == (obj.get("versionId") or "null")
 
 
 def convert_handler(event, context):
@@ -98,18 +178,27 @@ def convert_handler(event, context):
     for bucket, key, obj in events(event):
         if not key.lower().endswith(".pdf"):
             continue
+        identity = source_for_part(key)
+        if not identity:
+            logger.info("Skipping legacy part event %s", key)
+            continue
+        source_id, generation, _ = identity
         logger.info("Converting %s", key)
-        with workdir() as directory:
-            source = directory / "part.pdf"
-            metadata = download(bucket, key, source)
-            with pymupdf.open(source) as document:
-                text = pymupdf4llm.to_markdown(document, force_ocr=False)
-            if not text.strip():
-                raise ValueError(f"No Markdown extracted from {key}")
-            s3.put_object(
-                Bucket=destination, Key=key[:-4] + ".md", Body=text.encode("utf-8"),
-                ContentType="text/markdown; charset=utf-8", Metadata=metadata,
-            )
+        with coordination.locked(source_id):
+            if not valid_part(bucket, key, obj, source_id, generation):
+                logger.info("Skipping stale part event %s", key)
+                continue
+            with workdir() as directory:
+                source = directory / "part.pdf"
+                metadata = download(bucket, key, source, version=obj.get("versionId"))
+                with pymupdf.open(source) as document:
+                    text = pymupdf4llm.to_markdown(document, force_ocr=False)
+                if not text.strip():
+                    raise ValueError(f"No Markdown extracted from {key}")
+                s3.put_object(
+                    Bucket=destination, Key=key[:-4] + ".md", Body=text.encode("utf-8"),
+                    ContentType="text/markdown; charset=utf-8", Metadata=metadata,
+                )
         logger.info("Converted %s", key)
 
 
@@ -224,29 +313,73 @@ def chunk_handler(event, context):
     for bucket, key, obj in events(event):
         if not key.lower().endswith(".md"):
             continue
-        with workdir() as directory:
-            source = directory / "source.md"
-            metadata = download(bucket, key, source)
-            text = source.read_text(encoding="utf-8")
-        chunks = split_markdown(text)
-        if not chunks:
-            raise ValueError(f"No chunks produced from {key}")
-        source_key = base64.b64decode(metadata["source-key"], validate=True).decode("utf-8")
-        title = next((line[2:].strip() for line in text.splitlines() if line.startswith("# ")), "")
-        for number, chunk in enumerate(chunks, 1):
-            heading = next(
-                (line.lstrip("#").strip().removesuffix(" (continued)")
-                 for line in chunk.splitlines() if re.match(r"^#{1,2}\s", line)), ""
-            )
-            preamble = [f"> Source: {source_key}", f"> Part: {key}"]
-            if title:
-                preamble.append(f"> Document: {title}")
-            if heading and heading != title:
-                preamble.append(f"> Section: {heading}")
-            preamble.append(f"> Chunk {number} of {len(chunks)}")
-            body = "\n".join(preamble) + "\n\n" + chunk
-            s3.put_object(
-                Bucket=destination, Key=f"{key[:-3]}-chunk-{number:06d}.md",
-                Body=body.encode("utf-8"), ContentType="text/markdown; charset=utf-8",
-            )
+        identity = source_for_part(key)
+        if not identity:
+            logger.info("Skipping legacy Markdown event %s", key)
+            continue
+        source_id, generation, part = identity
+        with coordination.locked(source_id):
+            if not valid_part(bucket, key, obj, source_id, generation):
+                logger.info("Skipping stale Markdown event %s", key)
+                continue
+            state = coordination.state(source_id)
+            if not 1 <= int(part) <= state["expected"]:
+                raise ValueError(f"Unexpected part number in {key}")
+            coordination.clear_part(source_id, generation, part)
+            with workdir() as directory:
+                source = directory / "source.md"
+                metadata = download(bucket, key, source, version=obj.get("versionId"))
+                text = source.read_text(encoding="utf-8")
+            chunks = split_markdown(text)
+            if not chunks:
+                raise ValueError(f"No chunks produced from {key}")
+            source_key = base64.b64decode(metadata["source-key"], validate=True).decode("utf-8")
+            title = next((line[2:].strip() for line in text.splitlines() if line.startswith("# ")), "")
+            new_keys = set()
+            prefix = f"{key[:-3]}-chunk-"
+            for number, chunk in enumerate(chunks, 1):
+                heading = next(
+                    (line.lstrip("#").strip().removesuffix(" (continued)")
+                     for line in chunk.splitlines() if re.match(r"^#{1,2}\s", line)), ""
+                )
+                preamble = [f"> Source: {source_key}", f"> Part: {key}"]
+                if title:
+                    preamble.append(f"> Document: {title}")
+                if heading and heading != title:
+                    preamble.append(f"> Section: {heading}")
+                preamble.append(f"> Chunk {number} of {len(chunks)}")
+                body = "\n".join(preamble) + "\n\n" + chunk
+                encoded = body.encode("utf-8")
+                digest = hashlib.sha256(encoded).hexdigest()
+                chunk_key = f"{prefix}{number:06d}-{digest}.md"
+                new_keys.add(chunk_key)
+                s3.put_object(
+                    Bucket=destination, Key=chunk_key, Body=encoded,
+                    ContentType="text/markdown; charset=utf-8", Metadata={"sha256": digest},
+                )
+            for page in s3.get_paginator("list_objects_v2").paginate(
+                Bucket=destination, Prefix=prefix,
+            ):
+                obsolete = [
+                    {"Key": item["Key"]} for item in page.get("Contents", [])
+                    if item["Key"] not in new_keys
+                ]
+                if obsolete:
+                    result = s3.delete_objects(
+                        Bucket=destination, Delete={"Objects": obsolete, "Quiet": True},
+                    )
+                    if result.get("Errors"):
+                        raise RuntimeError(f"Failed to delete old chunks: {result['Errors']}")
+            coordination.mark_part(source_id, generation, part)
+            if coordination.completed_parts(source_id, generation) == state["expected"]:
+                s3.put_object(
+                    Bucket=destination,
+                    Key=f"__completion__/{source_id}/{generation}.json",
+                    Body=json.dumps({
+                        "source_key": source_key, "source_id": source_id,
+                        "generation": generation, "version": state["version"],
+                        "revision": state["revision"],
+                    }).encode("utf-8"),
+                    ContentType="application/json",
+                )
         logger.info("Chunked %s into %d chunks", key, len(chunks))

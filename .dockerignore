@@ -1,0 +1,8 @@
+*
+!processing
+!processing/**
+!coordination
+!coordination/python
+!coordination/python/coordination.py
+__pycache__
+*.pyc
