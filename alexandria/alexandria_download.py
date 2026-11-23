@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from aws_cdk import (
+    CfnOutput,
     Duration,
     RemovalPolicy,
     Size,
@@ -28,6 +29,7 @@ class AlexandriaDownloadStack(Stack):
             enforce_ssl=True,
             removal_policy=RemovalPolicy.RETAIN,
         )
+        self.bucket_name = bucket.bucket_name
         role = iam.Role(
             self, "DownloadRole",
             assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
@@ -66,3 +68,5 @@ class AlexandriaDownloadStack(Stack):
             schedule=events.Schedule.cron(minute="0", hour="0"),
             targets=[targets.LambdaFunction(download)],
         )
+
+        CfnOutput(self, "DownloadBucketName", value=bucket.bucket_name)
