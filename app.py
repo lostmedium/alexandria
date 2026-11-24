@@ -10,6 +10,7 @@ from alexandria.alexandria_processing import AlexandriaProcessingStack
 from alexandria.alexandria_cleanup import AlexandriaCleanupStack
 from alexandria.alexandria_staging import AlexandriaStagingStack
 from alexandria.alexandria_coordination import AlexandriaCoordinationStack
+from alexandria.alexandria_transfer import AlexandriaTransferStack
 
 app = cdk.App()
 
@@ -89,12 +90,27 @@ AlexandriaCleanupStack(
     )
 )
 
-AlexandriaStagingStack(
+staging_stack = AlexandriaStagingStack(
     app, "AlexandriaStagingStack",
     chunks_bucket_name = processing_stack.chunks_bucket_name,
     source_bucket_name = download_stack.bucket_name,
     coordination_table = coordination_stack.table,
     coordination_layer = coordination_stack.layer,
+    env = cdk.Environment(
+        account = os.getenv('CDK_DEFAULT_ACCOUNT'),
+        region = 'us-east-2'
+    ),
+    synthesizer = cdk.DefaultStackSynthesizer(
+        qualifier = 'lukach'
+    )
+)
+
+AlexandriaTransferStack(
+    app, "AlexandriaTransferStack",
+    staging_bucket_name = staging_stack.staging_bucket_name,
+    coordination_table = coordination_stack.table,
+    coordination_layer = coordination_stack.layer,
+    analyze_concurrency = int(app.node.try_get_context('analyzeConcurrency') or 50),
     env = cdk.Environment(
         account = os.getenv('CDK_DEFAULT_ACCOUNT'),
         region = 'us-east-2'

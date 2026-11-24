@@ -1,12 +1,14 @@
 # alexandria
 
 Alexandria downloads PDFs, converts them to Markdown, and prepares chunks for
-AI processing. It stages a completed PDF's chunks and a manifest in S3; it
-does not run an AI model.
+AI processing. It stages a completed PDF's chunks and a manifest in S3, then
+analyzes every staged chunk with Claude Haiku 5.5 on Amazon Bedrock and writes
+the verified results to an analyzed bucket.
 
 The downloader checks each PDF's RSS feed daily at 00:00 UTC. S3 events and SQS
 queues start processing when a PDF is uploaded. Staging runs after all parts of
-that PDF have been chunked, rather than on a schedule.
+that PDF have been chunked, rather than on a schedule. Analysis runs after
+staging publishes that PDF's manifest.
 
 ## Deployment
 
@@ -18,11 +20,11 @@ Docker daemon for the processing images. Install the Python dependencies with
 ```sh
 cdk deploy AlexandriaDynamodbStack AlexandriaCoordinationStack \
   AlexandriaDownloadStack AlexandriaProcessingStack AlexandriaCleanupStack \
-  AlexandriaStagingStack
+  AlexandriaStagingStack AlexandriaTransferStack
 ```
 
-Deploy outside the download schedule. The cleanup and staging stacks must be
-ready before the downloader runs. The `pdf` table is retained when its stack is
+Deploy outside the download schedule. The cleanup, staging and transfer stacks must
+be ready before the downloader runs. The `pdf` table is retained when its stack is
 deleted; handle any retained table before creating a replacement with the same
 name.
 
@@ -183,11 +185,156 @@ the staging dead-letter queue; monitor and redrive it. Retries reuse
 already-copied chunks, but the final pass must finish within the timeout to
 publish a manifest.
 
-All five application buckets have versioning enabled. Noncurrent object versions
+All six application buckets have versioning enabled. Noncurrent object versions
 become eligible for expiration seven days after they become noncurrent; current
 objects do not expire under these rules. Deletes create delete markers, and
 older versions remain recoverable until the lifecycle policy expires them.
 Buckets and queues are retained on stack deletion.
+
+## Transfer and analysis
+
+Writing a staging manifest (`*__manifest.json`) sends an event to the transfer
+queue. The transfer Lambda reads that manifest version and ignores the event
+if a newer manifest has replaced it. It then queues every listed chunk that
+does not already have a current analysis. An analysis is current when the
+analyzed object's `source-sha256`, `prompt-sha256` and `model-id` metadata
+match the staged chunk, the prompt and the model.
+
+The analyze Lambda reads each chunk by its staged version ID, checks its
+SHA-256 hash and sends it to the Global cross-Region inference (CRIS) profile
+`global.anthropic.claude-haiku-5-5` through the Bedrock Converse API. Thinking
+is disabled, effort is `high`, and the system prompt is cached. Up to 50
+analyses run at once by default.
+
+The chunk is sent inside `<document>` tags, and the model is told never to
+follow instructions inside them. The prompt asks for reference notes, not a
+summary. They must keep names, values and units, defaults, limits, conditions,
+negations, procedures, security behavior, tables and code. Generic statements
+and descriptions of the source are not allowed. The model works through the
+chunk in order and writes one `###` topic block per `#` or `##` section, because
+processing packs small sections together. It does not fill in text cut off at
+chunk boundaries. It drops PDF conversion artifacts such as running headers,
+page numbers and picture placeholders. A chunk with no technical content
+produces only `> **Technical Content:** None in this section.`
+
+The chunk's `> Source:` provenance lines are kept unchanged above the model
+output. A Markdown code-fence wrapper around the whole response is removed.
+Output is rejected and retried if the response was truncated, had a malformed
+wrapper, did not start with a `###` heading, used H1 or H2 headings, or left a
+code fence unclosed.
+
+Each analysis is written to the analyzed bucket under the staged chunk's key,
+with the source hash, source version, prompt hash, model ID and output hash in
+its metadata. Very short outputs relative to the input are logged as
+`HighCompression` for review.
+
+Claude Haiku 5.5 is available only on the Bedrock Standard tier. Batch
+inference and the Flex tier do not support it, so every chunk is an on-demand
+request. Caching the system prompt is the main cost saving: every chunk
+shares the same system prompt (about 2,500 tokens, above the 512-token cache
+minimum), so while the analyze queue keeps requests flowing, each request
+after the first in a five-minute window reads it from the cache.
+
+Claude Haiku 5.5 charges more for a request whose prompt exceeds 100,000
+tokens. The count includes the system prompt, cache reads, cache writes and
+the uncached input. Input and output for that whole request are billed at the
+higher rate, even with a cache hit. Claude's tokenizer produces at most one
+token per UTF-8 byte, so the analyze Lambda rejects any chunk larger than
+100,000 bytes minus the system prompt and 1,000 bytes of request overhead
+before calling Bedrock. Processing caps chunks at 15,000 characters, so
+normal chunks are far below this limit. If Bedrock's reported prompt tokens
+exceed 100,000, the Lambda logs `PricingCliff`. Monitor for both messages.
+
+Global CRIS can route requests from `us-east-2` to any commercial AWS Region.
+The Bedrock account must have access to Anthropic models. The analyze role is
+granted `bedrock:InvokeModel` on the global inference profile in `us-east-2`,
+on the foundation model in `us-east-2` and on the Region-less
+`arn:aws:bedrock:::foundation-model/anthropic.claude-haiku-5-5`. Bedrock
+evaluates that last resource with `aws:RequestedRegion` set to `unspecified`.
+A Region-restricting SCP must therefore allow it, for example by exempting
+requests that have a `bedrock:InferenceProfileArn`.
+
+### Verification
+
+After the last chunk of a run is analyzed, the verify Lambda checks every chunk
+in the current staging manifest. It holds the PDF's coordination lock while it
+does so. Verification succeeds only when each chunk has a current analysis. It
+then writes `My guide/source-<source-key-hash>__manifest.json` to the analyzed
+bucket and deletes obsolete analyses for that PDF only. The analyzed manifest
+lists each chunk's key, analyzed version ID, source SHA-256 and output SHA-256,
+plus the staging manifest version, model ID and prompt hash. If any chunk is
+missing, verification logs `AnalysisIncomplete` and does not write a manifest.
+
+### Running manually
+
+Both Lambdas accept the PDF's source key. This resumes from the staging bucket
+without downloading or reprocessing the PDF:
+
+```sh
+aws lambda invoke --region us-east-2 \
+  --function-name <TransferFunctionName> \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"source_key": "guides/My guide.pdf"}' /dev/stdout
+
+aws lambda invoke --region us-east-2 \
+  --function-name <VerifyFunctionName> \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"source_key": "guides/My guide.pdf"}' /dev/stdout
+```
+
+Transfer queues only chunks that are missing or out of date, then verifies.
+Changing the prompt or the model makes every existing analysis out of date. A
+manual transfer started while an automatic run for the same PDF is still in
+progress may analyze some chunks twice. The function names are stack outputs.
+
+Throttling and temporary Bedrock errors return the message to the queue after
+60 seconds, for up to 60 attempts. Other analysis failures, such as truncated
+or invalid output, get 3 attempts so failing model calls do not keep billing.
+When either limit is reached, the analyze Lambda moves the message to the
+analyze dead-letter queue and counts the chunk as settled. The run therefore
+still finishes, and verification logs `AnalysisIncomplete` with the missing
+chunk keys. The queue's own limit of 100 receives is only a backstop.
+
+Chunks are never lost: the staging manifest and the analyzed bucket are the
+record of what is done, and the queues only carry work. After fixing the cause,
+run the transfer Lambda manually; it re-queues only missing or outdated
+chunks. Monitor the transfer, analyze and verify dead-letter queues.
+
+To stop all analysis immediately, disable the analyze queue trigger. Messages
+wait in the queue until it is re-enabled:
+
+```sh
+FUNCTION=$(aws cloudformation describe-stack-resources --region us-east-2 \
+  --stack-name AlexandriaTransferStack \
+  --query "StackResources[?starts_with(LogicalResourceId,'AnalyzeFunction') && ResourceType=='AWS::Lambda::Function'].PhysicalResourceId" \
+  --output text)
+UUID=$(aws lambda list-event-source-mappings --region us-east-2 \
+  --function-name "$FUNCTION" --query "EventSourceMappings[0].UUID" --output text)
+aws lambda update-event-source-mapping --region us-east-2 --uuid "$UUID" --no-enabled
+```
+
+Use `--enabled` to resume. To discard the queued work instead, purge the
+analyze queue with `aws sqs purge-queue`, then run the transfer Lambda again
+later.
+
+### Concurrency
+
+Set the number of concurrent analyses at deploy time; the default is 50:
+
+```sh
+cdk deploy AlexandriaTransferStack -c analyzeConcurrency=100
+```
+
+The practical limit is the account's Bedrock quota
+`Cross-Region InvokeModel tokens per minute` for Claude Haiku 5.5 in
+`us-east-2`, shown in Service Quotas. Each request counts its input, cache
+writes and output against that quota, and each output token counts about five
+times. A typical chunk uses about 20,000 quota tokens, and a request takes
+about 30 seconds. Each concurrent analysis therefore needs about 40,000 tokens
+per minute. Divide the quota by 40,000 to find a concurrency that will not be
+throttled. A higher setting is safe, because throttled chunks wait and retry,
+but it adds little speed. Lambda concurrency counts against the account's
+concurrent-executions limit, which defaults to 1,000.
 
 Each PDF processing function has a 15-minute timeout, 4 GiB memory and 10 GiB
 temporary storage. Large or complex PDFs can still exceed these limits,

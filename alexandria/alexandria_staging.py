@@ -33,6 +33,7 @@ class AlexandriaStagingStack(Stack):
             versioned=True,
             lifecycle_rules=[s3.LifecycleRule(noncurrent_version_expiration=Duration.days(7))],
         )
+        self.staging_bucket_name = staging.bucket_name
         sync = lambda_.Function(
             self, "StagingSyncFunction",
             runtime=lambda_.Runtime.PYTHON_3_13,
