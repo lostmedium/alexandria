@@ -103,6 +103,7 @@ class AlexandriaProcessingStack(Stack):
                     "CHUNKS_BUCKET": chunks.bucket_name,
                     "COORDINATION_TABLE": coordination_table.table_name,
                     "CLEANUP_FUNCTION_NAME": cleanup_function_name,
+                    "QUEUE_URL": queue.queue_url,
                 },
                 log_group=processing_logs,
             )
@@ -111,6 +112,7 @@ class AlexandriaProcessingStack(Stack):
             bucket.grant_read(function)
             coordination_table.grant_read_write_data(function)
             if name == "Split":
+                chunks.grant_put(function)
                 function.add_to_role_policy(iam.PolicyStatement(
                     actions=["lambda:InvokeFunction"],
                     resources=[self.format_arn(
@@ -119,10 +121,14 @@ class AlexandriaProcessingStack(Stack):
                         arn_format=ArnFormat.COLON_RESOURCE_NAME,
                     )],
                 ))
+            if name == "Convert":
+                markdown.grant_read(function)
             if name == "Chunk":
                 chunks.grant_read(function)
                 chunks.grant_delete(function)
-            function.add_event_source(event_sources.SqsEventSource(queue, batch_size=1))
+            function.add_event_source(event_sources.SqsEventSource(
+                queue, batch_size=1, report_batch_item_failures=True,
+            ))
             filters = [s3.NotificationKeyFilter(suffix=suffix)] if suffix else []
             source.add_event_notification(
                 s3.EventType.OBJECT_CREATED,

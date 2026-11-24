@@ -13,7 +13,8 @@ from alexandria.alexandria_coordination import AlexandriaCoordinationStack
 class CoordinationTest(unittest.TestCase):
     def test_lock_releases_on_failure_and_aliases_reserved_attributes(self):
         table = Mock()
-        with patch.object(coordination, "table", return_value=table):
+        with patch.object(coordination, "table", return_value=table), \
+             patch.object(coordination.time, "time", return_value=1000):
             with self.assertRaisesRegex(ValueError, "failure"):
                 with coordination.locked("source"):
                     raise ValueError("failure")
@@ -22,7 +23,7 @@ class CoordinationTest(unittest.TestCase):
         self.assertEqual(acquire["ExpressionAttributeNames"], {"#expires": "expires"})
         self.assertEqual(release["ExpressionAttributeNames"], {"#owner": "owner"})
         self.assertEqual(acquire["Item"]["owner"], release["ExpressionAttributeValues"][":owner"])
-        self.assertGreaterEqual(acquire["Item"]["expires"], 1860)
+        self.assertEqual(acquire["Item"]["expires"], 1960)
 
     def test_contention_fails_instead_of_processing_unlocked(self):
         table = Mock()
@@ -36,6 +37,31 @@ class CoordinationTest(unittest.TestCase):
                     self.fail("A busy lock must not be acquired")
         table.delete_item.assert_not_called()
 
+    def test_nonblocking_contention_is_typed_and_does_not_sleep(self):
+        table = Mock()
+        table.put_item.side_effect = ClientError({
+            "Error": {"Code": "ConditionalCheckFailedException", "Message": "busy"},
+        }, "PutItem")
+        with patch.object(coordination, "table", return_value=table), \
+             patch.object(coordination.time, "sleep") as sleep:
+            with self.assertRaises(coordination.LockBusy):
+                with coordination.locked("source", wait_seconds=0):
+                    self.fail("A busy lock must not be acquired")
+        sleep.assert_not_called()
+        table.delete_item.assert_not_called()
+
+    def test_waiting_lock_retries_promptly_after_contention(self):
+        table = Mock()
+        table.put_item.side_effect = [
+            ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "PutItem"),
+            {},
+        ]
+        with patch.object(coordination, "table", return_value=table), \
+             patch.object(coordination.time, "sleep") as sleep:
+            with coordination.locked("source", wait_seconds=2):
+                pass
+        sleep.assert_called_once_with(0.25)
+
     def test_part_count_paginates(self):
         table = Mock()
         table.query.side_effect = [
@@ -47,6 +73,20 @@ class CoordinationTest(unittest.TestCase):
         self.assertTrue(table.query.call_args.kwargs["ConsistentRead"])
         self.assertEqual(table.query.call_args.kwargs["ExclusiveStartKey"],
                          {"pk": "source", "sk": "part"})
+
+    def test_completed_chunk_counts_paginate(self):
+        table = Mock()
+        table.query.side_effect = [
+            {"Items": [{"sk": "PART#generation#000001", "chunk_count": 2}],
+             "LastEvaluatedKey": {"pk": "source", "sk": "PART#generation#000001"}},
+            {"Items": [{"sk": "PART#generation#000002", "chunk_count": 1}]},
+        ]
+        with patch.object(coordination, "table", return_value=table):
+            self.assertEqual(coordination.completed_chunk_counts("source", "generation"),
+                             {"000001": 2, "000002": 1})
+        self.assertTrue(table.query.call_args.kwargs["ConsistentRead"])
+        self.assertEqual(table.query.call_args.kwargs["ExclusiveStartKey"],
+                         {"pk": "source", "sk": "PART#generation#000001"})
 
     def test_removes_part_records_across_pages(self):
         table = MagicMock()

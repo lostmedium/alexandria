@@ -6,7 +6,10 @@ import os
 import re
 import shutil
 import tempfile
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from urllib.parse import unquote_plus
 
@@ -19,24 +22,48 @@ from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-s3 = boto3.client("s3")
+s3 = boto3.client("s3", config=Config(max_pool_connections=20))
+sqs = boto3.client("sqs")
 lambda_client = boto3.client(
     "lambda", config=Config(read_timeout=900, retries={"total_max_attempts": 1}),
 )
-PAGE_LIMIT = 1000
+PAGE_LIMIT = 50
 CHUNK_LIMIT = 15000
 WORK_DIR = Path(tempfile.gettempdir()) / "alexandria-processing"
+pymupdf4llm.use_layout(False)
+
+# Lambda runtime resets can retain files from a timed-out invocation.
+if WORK_DIR.exists():
+    shutil.rmtree(WORK_DIR)
 
 
 @contextmanager
 def workdir():
-    if WORK_DIR.exists():
-        shutil.rmtree(WORK_DIR)
-    WORK_DIR.mkdir()
-    try:
-        yield WORK_DIR
-    finally:
-        shutil.rmtree(WORK_DIR)
+    WORK_DIR.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=WORK_DIR) as directory:
+        yield Path(directory)
+
+
+class ProcessingPending(RuntimeError):
+    pass
+
+
+def queue_handler(handler):
+    @wraps(handler)
+    def handle(event, context):
+        failures = []
+        for message in event["Records"]:
+            try:
+                handler({"Records": [message]}, context)
+            except (coordination.LockBusy, ProcessingPending) as error:
+                logger.info("Deferring %s: %s", message["messageId"], error)
+                sqs.change_message_visibility(
+                    QueueUrl=os.environ["QUEUE_URL"],
+                    ReceiptHandle=message["receiptHandle"], VisibilityTimeout=30,
+                )
+                failures.append({"itemIdentifier": message["messageId"]})
+        return {"batchItemFailures": failures}
+    return handle
 
 
 def events(event):
@@ -59,7 +86,7 @@ def download(bucket, key, path, *, etag=None, version=None):
     response = s3.get_object(**args)
     try:
         with open(path, "wb") as target:
-            shutil.copyfileobj(response["Body"], target)
+            shutil.copyfileobj(response["Body"], target, length=1024 * 1024)
     finally:
         response["Body"].close()
     return response.get("Metadata", {})
@@ -82,6 +109,7 @@ def cleanup(key):
         raise RuntimeError(f"Cleanup failed for {key}: {payload.decode('utf-8')}")
 
 
+@queue_handler
 def split_handler(event, context):
     destination = os.environ["DESTINATION_BUCKET"]
     for bucket, key, obj in events(event):
@@ -93,29 +121,31 @@ def split_handler(event, context):
         version = obj.get("versionId") or "null"
         filename = key.rsplit("/", 1)[-1][:-4]
         source_id = coordination.source_id(key)
-        generation = coordination.generation_id(version)
+        generation = coordination.generation_id(f"{version}:{uuid.uuid4()}")
         metadata = {
             "source-key": base64.b64encode(key.encode()).decode(),
             "source-version": base64.b64encode(version.encode()).decode(),
             "generation": generation,
         }
-        with coordination.locked(source_id):
-            if current_version(bucket, key) != version:
-                logger.info("Skipping stale PDF event for %s", key)
-                continue
-            state = coordination.state(source_id)
-            if state and state.get("status") == "blocked" and state.get("version") == version:
-                logger.info("Skipping blocked PDF version for %s", key)
-                continue
-            if state and state.get("status") == "ready" and state.get("generation") == generation:
-                logger.info("Already split %s", key)
-                continue
-            coordination.put_state(
-                source_id, status="splitting", source_key=key,
-                version=version, generation=generation,
-            )
-            coordination.clear_parts(source_id)
-            cleanup(key)
+        with coordination.locked(f"{source_id}:split", wait_seconds=0):
+            with coordination.locked(source_id):
+                if current_version(bucket, key) != version:
+                    logger.info("Skipping stale PDF event for %s", key)
+                    continue
+                state = coordination.state(source_id)
+                if state and state.get("status") == "blocked" and state.get("version") == version:
+                    logger.info("Skipping blocked PDF version for %s", key)
+                    continue
+                if state and state.get("status") == "ready" and state.get("version") == version:
+                    publish_completion(source_id, state)
+                    logger.info("Already split %s", key)
+                    continue
+                coordination.put_state(
+                    source_id, status="preparing", source_key=key,
+                    version=version, generation=generation,
+                )
+                coordination.clear_parts(source_id)
+                cleanup(key)
             with workdir() as directory:
                 source = directory / "source.pdf"
                 download(bucket, key, source, etag=etag, version=version)
@@ -125,6 +155,16 @@ def split_handler(event, context):
                     if document.page_count == 0:
                         raise ValueError(f"PDF has no pages: {key}")
                     expected = (document.page_count + PAGE_LIMIT - 1) // PAGE_LIMIT
+                    with coordination.locked(source_id):
+                        state = coordination.state(source_id)
+                        if not state or state.get("generation") != generation or \
+                                current_version(bucket, key) != version:
+                            logger.info("Discarding superseded split %s", key)
+                            continue
+                        coordination.put_state(
+                            source_id, status="splitting", source_key=key, version=version,
+                            generation=generation, revision=revision_id, expected=expected,
+                        )
                     for index, start in enumerate(range(0, document.page_count, PAGE_LIMIT), 1):
                         part_path = directory / "part.pdf"
                         with pymupdf.open() as part:
@@ -132,19 +172,35 @@ def split_handler(event, context):
                                 document, from_page=start,
                                 to_page=min(start + PAGE_LIMIT, document.page_count) - 1,
                             )
-                            part.save(part_path, garbage=4, deflate=True)
-                        s3.upload_file(
-                            str(part_path), destination,
-                            f"{filename}/source-{source_id}__revision-{revision_id}"
-                            f"__generation-{generation}__part-{index:06d}.pdf",
-                            ExtraArgs={"ContentType": "application/pdf", "Metadata": metadata},
-                        )
+                            part.save(part_path)
+                        with coordination.locked(source_id):
+                            state = coordination.state(source_id)
+                            if not state or state.get("generation") != generation or \
+                                    current_version(bucket, key) != version:
+                                logger.info("Discarding superseded split %s", key)
+                                break
+                            s3.upload_file(
+                                str(part_path), destination,
+                                f"{filename}/source-{source_id}__revision-{revision_id}"
+                                f"__generation-{generation}__part-{index:06d}.pdf",
+                                ExtraArgs={"ContentType": "application/pdf", "Metadata": metadata},
+                            )
                         part_path.unlink()
-            coordination.put_state(
-                source_id, status="ready", source_key=key, version=version,
-                generation=generation, revision=revision_id, expected=expected,
-            )
-        logger.info("Split %s into revision %s", key, revision_id)
+                    else:
+                        with coordination.locked(source_id):
+                            state = coordination.state(source_id)
+                            if not state or state.get("generation") != generation or \
+                                    current_version(bucket, key) != version:
+                                logger.info("Discarding superseded split %s", key)
+                                continue
+                            coordination.put_state(
+                                source_id, status="ready", source_key=key, version=version,
+                                generation=generation, revision=revision_id, expected=expected,
+                            )
+                            publish_completion(source_id, {
+                                **state, "status": "ready",
+                            })
+                        logger.info("Split %s into revision %s", key, revision_id)
 
 
 def source_for_part(key):
@@ -160,7 +216,10 @@ def source_for_part(key):
 
 def valid_part(bucket, key, obj, source, generation):
     state = coordination.state(source)
-    if not state or state.get("status") != "ready" or state.get("generation") != generation:
+    if state and state.get("status") == "preparing" and state.get("generation") == generation:
+        raise ProcessingPending(f"PDF split is not ready: {source}")
+    if not state or state.get("status") not in ("splitting", "ready") or \
+            state.get("generation") != generation:
         return False
     if current_version(os.environ["SOURCE_BUCKET"], state["source_key"]) != state["version"]:
         return False
@@ -173,6 +232,34 @@ def valid_part(bucket, key, obj, source, generation):
     return version == (obj.get("versionId") or "null")
 
 
+def publish_completion(source, state):
+    # Call under the source lease, including when the last chunk precedes split completion.
+    generation = state["generation"]
+    if state["status"] == "ready" and \
+            coordination.completed_parts(source, generation) == state["expected"]:
+        s3.put_object(
+            Bucket=os.environ["CHUNKS_BUCKET"],
+            Key=f"__completion__/{source}/{generation}.json",
+            Body=json.dumps({
+                "source_key": state["source_key"], "source_id": source,
+                "generation": generation, "version": state["version"],
+                "revision": state["revision"],
+            }).encode("utf-8"),
+            ContentType="application/json",
+        )
+
+
+def already_converted(destination, key, version):
+    try:
+        head = s3.head_object(Bucket=destination, Key=key[:-4] + ".md")
+    except ClientError as error:
+        if error.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise
+    return head.get("Metadata", {}).get("part-version") == version
+
+
+@queue_handler
 def convert_handler(event, context):
     destination = os.environ["DESTINATION_BUCKET"]
     for bucket, key, obj in events(event):
@@ -182,22 +269,33 @@ def convert_handler(event, context):
         if not identity:
             logger.info("Skipping legacy part event %s", key)
             continue
-        source_id, generation, _ = identity
+        source_id, generation, part = identity
         logger.info("Converting %s", key)
-        with coordination.locked(source_id):
+        with coordination.locked(
+            f"{source_id}:convert:{generation}:{part}", wait_seconds=0,
+        ):
             if not valid_part(bucket, key, obj, source_id, generation):
                 logger.info("Skipping stale part event %s", key)
+                continue
+            version = obj.get("versionId") or "null"
+            if already_converted(destination, key, version):
+                logger.info("Already converted %s", key)
                 continue
             with workdir() as directory:
                 source = directory / "part.pdf"
                 metadata = download(bucket, key, source, version=obj.get("versionId"))
                 with pymupdf.open(source) as document:
-                    text = pymupdf4llm.to_markdown(document, force_ocr=False)
+                    text = pymupdf4llm.to_markdown(document, show_progress=False)
                 if not text.strip():
                     raise ValueError(f"No Markdown extracted from {key}")
+            with coordination.locked(source_id, wait_seconds=2):
+                if not valid_part(bucket, key, obj, source_id, generation):
+                    logger.info("Discarding superseded conversion %s", key)
+                    continue
                 s3.put_object(
                     Bucket=destination, Key=key[:-4] + ".md", Body=text.encode("utf-8"),
-                    ContentType="text/markdown; charset=utf-8", Metadata=metadata,
+                    ContentType="text/markdown; charset=utf-8",
+                    Metadata={**metadata, "part-version": version},
                 )
         logger.info("Converted %s", key)
 
@@ -308,6 +406,7 @@ def split_markdown(text):
     return result
 
 
+@queue_handler
 def chunk_handler(event, context):
     destination = os.environ["DESTINATION_BUCKET"]
     for bucket, key, obj in events(event):
@@ -318,68 +417,72 @@ def chunk_handler(event, context):
             logger.info("Skipping legacy Markdown event %s", key)
             continue
         source_id, generation, part = identity
-        with coordination.locked(source_id):
+        if not valid_part(bucket, key, obj, source_id, generation):
+            logger.info("Skipping stale Markdown event %s", key)
+            continue
+        with workdir() as directory:
+            source = directory / "source.md"
+            metadata = download(bucket, key, source, version=obj.get("versionId"))
+            text = source.read_text(encoding="utf-8")
+        chunks = split_markdown(text)
+        if not chunks:
+            raise ValueError(f"No chunks produced from {key}")
+        source_key = base64.b64decode(metadata["source-key"], validate=True).decode("utf-8")
+        title = next((line[2:].strip() for line in text.splitlines() if line.startswith("# ")), "")
+        new_keys = set()
+        uploads = []
+        prefix = f"{key[:-3]}-chunk-"
+        for number, chunk in enumerate(chunks, 1):
+            heading = next(
+                (line.lstrip("#").strip().removesuffix(" (continued)")
+                 for line in chunk.splitlines() if re.match(r"^#{1,2}\s", line)), ""
+            )
+            preamble = [f"> Source: {source_key}", f"> Part: {key}"]
+            if title:
+                preamble.append(f"> Document: {title}")
+            if heading and heading != title:
+                preamble.append(f"> Section: {heading}")
+            preamble.append(f"> Chunk {number} of {len(chunks)}")
+            body = "\n".join(preamble) + "\n\n" + chunk
+            encoded = body.encode("utf-8")
+            digest = hashlib.sha256(encoded).hexdigest()
+            chunk_key = f"{prefix}{number:06d}-{digest}.md"
+            new_keys.add(chunk_key)
+            uploads.append((chunk_key, encoded, digest))
+
+        def upload(item):
+            chunk_key, encoded, digest = item
+            return s3.put_object(
+                Bucket=destination, Key=chunk_key, Body=encoded,
+                ContentType="text/markdown; charset=utf-8", Metadata={"sha256": digest},
+            )
+
+        with coordination.locked(source_id, wait_seconds=2):
             if not valid_part(bucket, key, obj, source_id, generation):
-                logger.info("Skipping stale Markdown event %s", key)
+                logger.info("Discarding superseded chunks %s", key)
                 continue
             state = coordination.state(source_id)
             if not 1 <= int(part) <= state["expected"]:
                 raise ValueError(f"Unexpected part number in {key}")
             coordination.clear_part(source_id, generation, part)
-            with workdir() as directory:
-                source = directory / "source.md"
-                metadata = download(bucket, key, source, version=obj.get("versionId"))
-                text = source.read_text(encoding="utf-8")
-            chunks = split_markdown(text)
-            if not chunks:
-                raise ValueError(f"No chunks produced from {key}")
-            source_key = base64.b64decode(metadata["source-key"], validate=True).decode("utf-8")
-            title = next((line[2:].strip() for line in text.splitlines() if line.startswith("# ")), "")
-            new_keys = set()
-            prefix = f"{key[:-3]}-chunk-"
-            for number, chunk in enumerate(chunks, 1):
-                heading = next(
-                    (line.lstrip("#").strip().removesuffix(" (continued)")
-                     for line in chunk.splitlines() if re.match(r"^#{1,2}\s", line)), ""
+            existing = {
+                item["Key"]
+                for page in s3.get_paginator("list_objects_v2").paginate(
+                    Bucket=destination, Prefix=prefix,
                 )
-                preamble = [f"> Source: {source_key}", f"> Part: {key}"]
-                if title:
-                    preamble.append(f"> Document: {title}")
-                if heading and heading != title:
-                    preamble.append(f"> Section: {heading}")
-                preamble.append(f"> Chunk {number} of {len(chunks)}")
-                body = "\n".join(preamble) + "\n\n" + chunk
-                encoded = body.encode("utf-8")
-                digest = hashlib.sha256(encoded).hexdigest()
-                chunk_key = f"{prefix}{number:06d}-{digest}.md"
-                new_keys.add(chunk_key)
-                s3.put_object(
-                    Bucket=destination, Key=chunk_key, Body=encoded,
-                    ContentType="text/markdown; charset=utf-8", Metadata={"sha256": digest},
-                )
-            for page in s3.get_paginator("list_objects_v2").paginate(
-                Bucket=destination, Prefix=prefix,
-            ):
-                obsolete = [
-                    {"Key": item["Key"]} for item in page.get("Contents", [])
-                    if item["Key"] not in new_keys
-                ]
-                if obsolete:
-                    result = s3.delete_objects(
-                        Bucket=destination, Delete={"Objects": obsolete, "Quiet": True},
-                    )
-                    if result.get("Errors"):
-                        raise RuntimeError(f"Failed to delete old chunks: {result['Errors']}")
-            coordination.mark_part(source_id, generation, part)
-            if coordination.completed_parts(source_id, generation) == state["expected"]:
-                s3.put_object(
+                for item in page.get("Contents", [])
+            }
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                for _ in executor.map(upload, (item for item in uploads if item[0] not in existing)):
+                    pass
+            obsolete = [{"Key": old_key} for old_key in existing - new_keys]
+            for start in range(0, len(obsolete), 1000):
+                result = s3.delete_objects(
                     Bucket=destination,
-                    Key=f"__completion__/{source_id}/{generation}.json",
-                    Body=json.dumps({
-                        "source_key": source_key, "source_id": source_id,
-                        "generation": generation, "version": state["version"],
-                        "revision": state["revision"],
-                    }).encode("utf-8"),
-                    ContentType="application/json",
+                    Delete={"Objects": obsolete[start:start + 1000], "Quiet": True},
                 )
+                if result.get("Errors"):
+                    raise RuntimeError(f"Failed to delete old chunks: {result['Errors']}")
+            coordination.mark_part(source_id, generation, part, len(new_keys))
+            publish_completion(source_id, state)
         logger.info("Chunked %s into %d chunks", key, len(chunks))

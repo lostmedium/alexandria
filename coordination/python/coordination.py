@@ -31,15 +31,19 @@ def put_state(source, **values):
     table().put_item(Item={"pk": source, "sk": "STATE", **values})
 
 
+class LockBusy(RuntimeError):
+    pass
+
+
 @contextmanager
-def locked(source):
+def locked(source, *, wait_seconds=30):
     owner = str(uuid.uuid4())
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + wait_seconds
     while True:
         now = int(time.time())
         try:
             table().put_item(
-                Item={"pk": source, "sk": "LOCK", "owner": owner, "expires": now + 1860},
+                Item={"pk": source, "sk": "LOCK", "owner": owner, "expires": now + 960},
                 ConditionExpression="attribute_not_exists(pk) OR #expires < :now",
                 ExpressionAttributeNames={"#expires": "expires"},
                 ExpressionAttributeValues={":now": now},
@@ -49,8 +53,8 @@ def locked(source):
             if error.response["Error"]["Code"] != "ConditionalCheckFailedException":
                 raise
             if time.monotonic() >= deadline:
-                raise RuntimeError(f"PDF processing is already in progress: {source}") from error
-            time.sleep(2)
+                raise LockBusy(f"PDF processing is already in progress: {source}") from error
+            time.sleep(0.25)
     try:
         yield
     finally:
@@ -62,9 +66,9 @@ def locked(source):
         )
 
 
-def mark_part(source, generation, part):
+def mark_part(source, generation, part, chunk_count):
     table().put_item(Item={
-        "pk": source, "sk": f"PART#{generation}#{part}",
+        "pk": source, "sk": f"PART#{generation}#{part}", "chunk_count": chunk_count,
     })
 
 
@@ -103,4 +107,20 @@ def completed_parts(source, generation):
         count += page["Count"]
         if "LastEvaluatedKey" not in page:
             return count
+        args["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+
+
+def completed_chunk_counts(source, generation):
+    prefix = f"PART#{generation}#"
+    args = {
+        "KeyConditionExpression": Key("pk").eq(source) & Key("sk").begins_with(prefix),
+        "ConsistentRead": True,
+    }
+    counts = {}
+    while True:
+        page = table().query(**args)
+        for item in page["Items"]:
+            counts[item["sk"][len(prefix):]] = item.get("chunk_count")
+        if "LastEvaluatedKey" not in page:
+            return counts
         args["ExclusiveStartKey"] = page["LastEvaluatedKey"]

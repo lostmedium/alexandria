@@ -9,12 +9,15 @@ from botocore.exceptions import ClientError
 
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "coordination" / "python"))
+import coordination
 
 
 class FakeCoordination:
+    LockBusy = coordination.LockBusy
+
     def __init__(self):
         self.states = {}
-        self.parts = set()
+        self.parts = {}
         self.locks = {}
 
     @staticmethod
@@ -26,10 +29,14 @@ class FakeCoordination:
         return hashlib.sha256(version.encode()).hexdigest()
 
     @contextmanager
-    def locked(self, source):
+    def locked(self, source, *, wait_seconds=30):
         lock = self.locks.setdefault(source, threading.Lock())
-        with lock:
+        if not lock.acquire(timeout=wait_seconds):
+            raise self.LockBusy(f"PDF processing is already in progress: {source}")
+        try:
             yield
+        finally:
+            lock.release()
 
     def state(self, source):
         return self.states.get(source)
@@ -37,17 +44,21 @@ class FakeCoordination:
     def put_state(self, source, **values):
         self.states[source] = values
 
-    def mark_part(self, source, generation, part):
-        self.parts.add((source, generation, part))
+    def mark_part(self, source, generation, part, chunk_count=None):
+        self.parts[(source, generation, part)] = chunk_count
 
     def clear_part(self, source, generation, part):
-        self.parts.discard((source, generation, part))
+        self.parts.pop((source, generation, part), None)
 
     def clear_parts(self, source):
-        self.parts = {item for item in self.parts if item[0] != source}
+        self.parts = {item: count for item, count in self.parts.items() if item[0] != source}
 
     def completed_parts(self, source, generation):
         return sum(item[:2] == (source, generation) for item in self.parts)
+
+    def completed_chunk_counts(self, source, generation):
+        return {part: count for (item_source, item_generation, part), count in self.parts.items()
+                if (item_source, item_generation) == (source, generation)}
 
 
 class FakeS3:

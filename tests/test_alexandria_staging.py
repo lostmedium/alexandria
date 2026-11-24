@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import quote_plus
@@ -44,7 +45,7 @@ class StagingTest(unittest.TestCase):
             generation=self.generation, revision=self.revision, expected=2,
         )
         for part in ("000001", "000002"):
-            self.coordination.mark_part(self.source, self.generation, part)
+            self.coordination.mark_part(self.source, self.generation, part, 1)
             body = f"chunk {part}".encode()
             digest = hashlib.sha256(body).hexdigest()
             key = f"{self.revision_prefix}part-{part}-chunk-000001-{digest}.md"
@@ -111,13 +112,35 @@ class StagingTest(unittest.TestCase):
         self.assertNotIn(("staging", self.manifest_key), self.s3.objects)
         with self.assertRaisesRegex(RuntimeError, "not ready"):
             staging.lambda_handler({"source_key": self.key}, None)
-        self.coordination.mark_part(self.source, self.generation, "000002")
+        self.coordination.mark_part(self.source, self.generation, "000002", 1)
         old_event = self.completion_event()
         self.s3.put_object("chunks", self.marker, b"new", "application/json")
         staging.lambda_handler(old_event, None)
         self.assertNotIn(("staging", self.manifest_key), self.s3.objects)
         self.s3.put_object("downloads", self.key, b"new pdf", "application/pdf")
         staging.lambda_handler(self.completion_event(), None)
+        self.assertNotIn(("staging", self.manifest_key), self.s3.objects)
+
+    def test_missing_chunk_does_not_replace_previous_manifest(self):
+        self.s3.put_object("staging", self.manifest_key, b'{"old": true}', "application/json")
+        missing = next(key for bucket, key in self.s3.objects
+                       if bucket == "chunks" and "__part-000002-" in key)
+        del self.s3.objects[("chunks", missing)]
+        with self.assertRaisesRegex(ValueError, "Missing or unexpected chunks"):
+            staging.lambda_handler(self.completion_event(), None)
+        self.assertEqual(self.s3.objects[("staging", self.manifest_key)]["body"], b'{"old": true}')
+        self.assertEqual(self.s3.copies, [])
+
+    def test_accepts_dynamodb_decimal_chunk_counts(self):
+        for part in ("000001", "000002"):
+            self.coordination.mark_part(self.source, self.generation, part, Decimal(1))
+        staging.lambda_handler(self.completion_event(), None)
+        self.assertIn(("staging", self.manifest_key), self.s3.objects)
+
+    def test_missing_one_of_multiple_chunks_in_a_part_fails(self):
+        self.coordination.mark_part(self.source, self.generation, "000001", 2)
+        with self.assertRaisesRegex(ValueError, "Missing or unexpected chunks"):
+            staging.lambda_handler(self.completion_event(), None)
         self.assertNotIn(("staging", self.manifest_key), self.s3.objects)
 
 

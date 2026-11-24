@@ -2,7 +2,9 @@ import hashlib
 import json
 import logging
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from itertools import islice
 from urllib.parse import unquote_plus
 
@@ -114,7 +116,27 @@ def stage(source_id, generation, marker_version=None):
         revision_prefix = (
             f"{source_prefix}revision-{state['revision']}__generation-{generation}__"
         )
-        source_keys = (key for key in keys(chunks_bucket, revision_prefix) if key.endswith(".md"))
+        source_keys = [key for key in keys(chunks_bucket, revision_prefix) if key.endswith(".md")]
+        counts = coordination.completed_chunk_counts(source_id, generation)
+        actual = {}
+        for key in source_keys:
+            match = re.fullmatch(
+                re.escape(revision_prefix) + r"part-(\d{6,})-chunk-(\d{6,})-[0-9a-f]{64}\.md",
+                key,
+            )
+            if not match:
+                raise ValueError(f"Unexpected chunk key: {key}")
+            part, number = match.groups()
+            actual.setdefault(part, []).append(int(number))
+        expected_parts = {f"{part:06d}" for part in range(1, int(state["expected"]) + 1)}
+        if set(counts) != expected_parts or set(actual) != expected_parts or any(
+            not isinstance(counts[part], (int, Decimal)) or counts[part] <= 0 or
+            counts[part] != int(counts[part]) or
+            sorted(actual[part]) != list(range(1, int(counts[part]) + 1))
+            for part in expected_parts
+        ):
+            raise ValueError(f"Missing or unexpected chunks for completed PDF {state['source_key']}")
+        source_keys = iter(source_keys)
         entries = []
         with ThreadPoolExecutor(max_workers=16) as executor:
             while batch := list(islice(source_keys, 100)):
